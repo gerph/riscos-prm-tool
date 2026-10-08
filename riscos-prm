@@ -1,0 +1,1360 @@
+#!/usr/bin/env perl
+##
+# Look up things in the PRMs.
+#
+# We try to look up the details in the published PRMs online. We keep a cache
+# of the index so that we can look things up reasonably reliably.
+# By default we try to create markdown content as a summary for SWI calls.
+# This means that SWI information appears in a presentable form in the terminal.
+#
+# Use:
+#
+#   riscos-prm --help
+#       - for help on the command usage.
+#
+# Environment variables used:
+#
+#   BROWSER
+#       - May be set to the name of the command to invoke the browser.
+#         A default will be selected if none can be found locally.
+#
+
+use strict;
+use warnings;
+
+my $cache_home = $ENV{'XDG_CACHE_HOME'} // ($ENV{'HOME'} . '/.cache');
+my $cache = "$cache_home/riscos-prm";
+my $indexurl = 'http://www.riscos.com/support/developers/prm_index/prmindex.html';
+my $baseurl = 'http://www.riscos.com/support/developers/prm/';
+my $summary_url = undef;
+my $debug = 0;
+
+
+my $op = 'lookup';
+my $request = undef;
+my $how = 'default';
+my $no_tables = 0;
+my $browser = $ENV{'BROWSER'} // 'auto';
+my %select_type;
+
+# Read our arguments
+while (defined(my $arg = shift @ARGV))
+{
+    if ($arg =~ /^(-h|-help|--help)/)
+    {
+        print <<EOM;
+Syntax: riscos-prm --help
+        riscos-prm --vectors|--swis|--services|--commands|--chapters
+        riscos-prm [<options>]
+                    <vector|swi|service|command|chapter name>
+        riscos-prm [<options>] "SWI <hex number>"
+        riscos-prm [<options>] "Service <hex number>"
+
+The 'riscos-prm' command will look up content in the Programmers
+Reference Manual and display the relevant section from the
+documentation. By default, SWI calls and services will be
+displayed as readable markdown, and other content will be
+launched in a browser. SWI calls and services can also be
+looked up by their hexadecimal number (e.g. 'SWI 33' or
+'Service 400C0').
+
+Options:
+
+    --url       display the URL, rather than opening the documentation.
+    --open      launch the browser on the documentation.
+    --summary   display a summary of the interface (only for SWIs).
+    --no-tables avoid using tables in the summary.
+
+    --vector    search for Vectors.
+    --swi       search for SWIs.
+    --service   search for Services.
+    --command   search for Commands.
+    --chapter   seach for Chapters.
+
+    --vectors   list all Vectors.
+    --swis      list all SWIs.
+    --services  list all Services.
+    --commands  list all Commands.
+    --chapters  list all Chapters.
+
+Examples:
+
+    riscos-prm OS_UpCall
+        - look up the documentation for SWI OS_UpCall
+
+    riscos-prm OS_File 1
+        - look up the documentation for SWI OS_File 1
+
+    riscos-prm CnPV
+        - look up the documentation for vector CnPV
+
+    riscos-prm "SWI 33"
+        - look up the documentation for SWI OS_UpCall (&33)
+
+    riscos-prm "Service 400C0"
+        - look up the documentation for Service_ErrorStarting (&400C0)
+
+    riscos-prm Service_ErrorStarting
+        - look up the documentation for service ErrorStarting
+
+    riscos-prm AddTinyDir
+        - look up the documentation for *AddTinyDir
+
+    riscos-prm Squash
+        - look up the documentation for the Squash module
+
+    riscos-prm --chapters
+        - list all chapters
+
+    riscos-prm --url Buffer Manager
+        - display the URL to show documentation for the
+          Buffer Manager
+
+The tool will exit with:
+
+    0 - located a reference and tried to open a URL.
+    1 - no reference was found.
+    2 - multiple references were found.
+    3 - no web browser was found to open URL,
+        or could not summarise the URL.
+EOM
+        exit;
+    }
+    elsif ($arg =~ /^--url$/)
+    {
+        $how = 'url';
+    }
+    elsif ($arg =~ /^--summary$/)
+    {
+        $how = 'summary';
+    }
+    elsif ($arg =~ /^--open$/)
+    {
+        $how = 'open';
+    }
+    elsif ($arg =~ /^--no-tables$/)
+    {
+        $no_tables = 1;
+    }
+    elsif ($arg =~ /^--(swis|vectors|services|commands|chapters)$/)
+    {
+        $op = "list-$1";
+    }
+    elsif ($arg =~ /^--(swi|vector|service|command|chapter)$/)
+    {
+        $select_type{$1} = 1;
+    }
+    elsif ($arg eq '-d' || $arg eq '--debug')
+    {
+        $debug = 1;
+    }
+    else
+    {
+        if (defined $request)
+        {
+            $request .= ' ' . $arg;
+        }
+        else
+        {
+            $request = $arg;
+        }
+    }
+}
+
+# Ensure that our cache directory exists
+mkdir $cache;
+
+sub get_url
+{
+    my ($key, $url) = @_;
+    my $file = "$cache/$key";
+    my $page = '';
+    if (!-f "$cache/$key")
+    {
+        system 'wget', '--quiet', '-O', $file, $url;
+    }
+    if (open(my $fh, '<', $file))
+    {
+        sysread($fh, $page, -s $file);
+        close($fh);
+    }
+    return $page;
+}
+
+my $index = get_url('index', $indexurl);
+my @sections = split /<hr>/, $index;
+
+my %chapters;
+
+my %commands;
+my %swis;
+my %swinums;
+# SWI reason codes which are documented as several 'reason,sub-reason' entries,
+# keyed by the reason code's name (eg 'OS_Word 14') - each holds the SWI number
+# and the list of [name, link] pairs for its sub-reason entries.
+my %swigroups;
+my %swinum_names;
+my %services;
+my %servicenums;
+my %servicenum_names;
+my %vectors;
+
+
+sub key_simplify {
+    my ($key) = @_;
+
+    $key =~ s/^The //i;
+    $key =~ s/ module$//i;
+    $key =~ s/ module \(?for/ for/i;
+    $key =~ s/RISC OS//i;
+    $key =~ s/^\*//;
+    $key =~ s/[()+]//g;
+    $key =~ s/  +/ /g;
+    $key =~ s/^ +//;
+    $key =~ s/ +$//;
+    return $key;
+}
+
+
+sub key_normalise {
+    my ($key) = @_;
+
+    $key = key_simplify($key);
+
+    $key =~ s/ //g;
+    $key =~ tr/A-Z/a-z/;
+    return $key;
+}
+
+
+sub open_url {
+    my ($url) = @_;
+    my $tool = undef;
+    my @args = ();
+
+    if ($how eq 'url' || ! -t 0)
+    {
+        print "$url\n";
+        return;
+    }
+
+    my @candidates;
+    if ($browser eq '' || $browser eq 'auto')
+    {
+        @candidates = ('host-open', 'w3m', 'links', 'lynx');
+        if ($^O eq 'darwin')
+        {
+            push @candidates, 'open';
+        }
+        else
+        {
+            push @candidates, 'xdg-open';
+        }
+    }
+    else
+    {
+        @candidates = ($browser);
+    }
+    for my $cmd (@candidates)
+    {
+        if ($cmd =~ m!^(/[^ ]*)!)
+        {
+            my $exe = $1;
+            if (-x "$exe")
+            {
+                $tool = $cmd;
+            }
+        }
+
+        my $ok = `which $cmd 2>&1`;
+        if ($ok ne '')
+        {
+            $tool = $cmd;
+            last;
+        }
+    }
+    if (!$tool)
+    {
+        print STDERR "No browser available for $url\n";
+        exit(3)
+    }
+
+    if ($tool eq 'w3m')
+    {
+        @args = ('-graph', '-o', 'confirm_qq=false');
+    }
+
+    print "Opening $url\n" if ($debug);
+    system $tool, @args, $url;
+}
+
+sub untable
+{
+    my ($line) = @_;
+    $line =~ s!</tr>!!g;
+    $line =~ s!</t[dh]>!!g;
+    $line =~ s!<td[^>]*colspan="(\d+)"[^>]*>!"<td>" x int($1)!ge;
+    $line =~ s!<tr[^>]+>!<tr>!g;
+    $line =~ s!<td[^>]+>!<td>!g;
+    $line =~ s!<th[^>]+>!<th>!g;
+    $line =~ s![\n ]*<tr>[\n ]*!<tr>!g;
+    $line =~ s![\n ]*<td>[\n ]*!<td>!g;
+    $line =~ s![\n ]*<th>[\n ]*!<th>!g;
+
+    my @rows;
+    my @head;
+    my $ignore_first = 1;
+    my $maxcol = 0;
+    for my $row (split /<tr>/, $line)
+    {
+        # The PRM has a few tables with formatting tags which begin in one
+        # cell and end in another.  Markdown formatting cannot represent
+        # that, so convert cells to plain text before constructing the table.
+        # This also prevents a literal pipe from creating an extra column.
+        my @cols = map { unescape_table_cell($_) } split /<t[dh]>/, $row;
+        if ($ignore_first)
+        {
+            $ignore_first = 0;
+            next;
+        }
+        # The first element should be empty.
+        shift @cols;
+        if (scalar(@cols) > $maxcol)
+        {
+            $maxcol = scalar(@cols);
+        }
+        if ($row =~ /<th>/)
+        {
+            @head = @cols;
+        }
+        else
+        {
+            push @rows, \@cols;
+        }
+    }
+
+    my @widths = (0,) x $maxcol;
+    for my $row (@rows)
+    {
+        my $n = 0;
+        for my $col (@$row)
+        {
+            if (length($col) > $widths[$n])
+            {
+                $widths[$n] = length($col);
+            }
+            $n++;
+        }
+    }
+
+    if ($no_tables)
+    {
+        # If it's only a simple two-column table, we can simplify it
+        # into some bullets.
+        if (scalar(@head) == 2 && 0)
+        {
+            my @table;
+            my $headlabel = '';
+            my $divider = ' : ';
+            if ($head[0] =~ /^R\d+$/)
+            {
+                $headlabel = $head[0] . " = ";
+                $divider = " => ";
+            }
+            for my $row (@rows)
+            {
+                my @elements;
+                push @table, "* $headlabel$row->[0] $divider $row->[1]";
+            }
+
+            $line = join "\n", @table;
+        }
+        else
+        {
+            my @table;
+            for my $row (@rows)
+            {
+                my @elements;
+                my $n = 0;
+                for my $col (@$row)
+                {
+                    push @elements, sprintf " %-*s ", $widths[$n], $col;
+                    $n++;
+                }
+                my $value = "* " . join(':', @elements);
+                $value =~ s/ *$//;
+                push @table, $value;
+            }
+            $line = join "\n", @table;
+        }
+    }
+    else
+    {
+        my @table;
+        if (!@head)
+        {
+            # We don't know the heading, so we need to create some
+            if ($maxcol == 2)
+            {
+                @head = ("Value", "Meaning");
+            }
+            else
+            {
+                @head = ("-",) x $maxcol;
+            }
+        }
+        if (@head)
+        {
+            my @elements;
+            my $n = 0;
+            for my $col (@head)
+            {
+                push @elements, sprintf " %-*s ", $widths[$n], $col;
+                $n++;
+            }
+            push @table, "|" . join('|', @elements) . "|";
+            push @table, "|" . join('|', map { '-' x length($_) } @elements) . "|";
+        }
+        for my $row (@rows)
+        {
+            my @elements;
+            my $n = 0;
+            for my $col (@$row)
+            {
+                push @elements, sprintf " %-*s ", $widths[$n], $col;
+                $n++;
+            }
+            push @table, "|" . join('|', @elements) . "|";
+        }
+
+        $line = join "\n", @table;
+    }
+
+    return $line;
+}
+
+
+sub unescape_table_cell
+{
+    my ($line) = @_;
+
+    # Do this before unescape() translates these tags to Markdown markers.
+    # Some old PRM tables have unbalanced tags that cross cell boundaries.
+    $line =~ s/<\/?(?:b|i|tt)>//ig;
+    $line = unescape($line);
+    $line =~ s/\|/\\|/g;
+    return $line;
+}
+
+
+sub unescape
+{
+    my ($line) = @_;
+
+    # Special cases for some forms that are used.
+    if (defined $summary_url)
+    {
+        $line =~ s/<a href="#([^"]+)">([^<]+)<\/a>/[$2]($summary_url#$1)/g;
+    }
+    $line =~ s/<a href="([^"\/]+)">([^<]+)<\/a>/[$2]($baseurl$1)/g;
+    $line =~ s/ \(see <a href="[^"]+">([^<]+)<\/a>.*?\) ?//g;
+    $line =~ s/<a href="[^"]+">([^<]+)<\/a>/$1/g;
+
+    $line =~ s/<\/?d[ldt]>//g;
+
+    $line =~ s/<p>(.*?)<\/p>/$1\n/g;
+
+    # Tables are converted before inline formatting so that malformed PRM
+    # formatting tags cannot leak Markdown markers between cells.
+    $line =~ s/ *<table>(.*?)<\/table> */untable($1)/ge;
+
+    $line =~ s/<tt>(.*?)<\/tt>/`$1`/g;
+    $line =~ s/<b>(.*?)<\/b>/**$1**/g;
+    $line =~ s/<i>(.*?)<\/i>/*$1*/g;
+
+    $line =~ s/<!--.*?-->//g;
+
+    $line =~ s/<img src="[^"]+" alt="([^"]+)">/$1/g;
+
+    $line =~ s/<[^>]*>//g;
+
+    $line =~ s/\n +/\n/g;
+    $line =~ s/\n\n+/\n/g;
+    $line =~ s/\n$//;
+
+    $line =~ s/&dagger;/†/g;
+    $line =~ s/&times;/×/g;
+    $line =~ s/&nbsp;/ /g;
+    $line =~ s/&copy;/©/g;
+    $line =~ s/&laquo;/«/g;
+    $line =~ s/&raquo;/»/g;
+    $line =~ s/&amp;/&/g;
+    $line =~ s/&lt;/</g;
+    $line =~ s/&gt;/>/g;
+
+    # Fix up the things that Justin broke when he released the wrong thing */
+    $line =~ s/=> ([A-Z ]+)_/=> \L$1,/g;
+
+    return $line;
+}
+
+
+##
+# Read the one-line purpose of the entry at a URL (the paragraph that follows
+# its heading), as plain text.
+sub entry_purpose {
+    my ($url) = @_;
+    my ($pageurl, $id) = ($url =~ /^(.*)#(.*)/);
+    return '' if (!defined $id);
+    my ($key) = ($pageurl =~ m!/([^/]+/[^/]+)$!);
+    if ($key) {
+        $key =~ s!/!-!;
+    } else {
+        $key = key_normalise("SWI-$pageurl");
+    }
+    my $page = get_url($key, $pageurl);
+    if ($page =~ /<a name="\Q$id\E"><\/a>[^\n]*\n<p[^>]*>(.*?)<\/p>/is)
+    {
+        my $purpose = unescape($1);
+        $purpose =~ s/\s+/ /g;
+        $purpose =~ s/^ //;
+        $purpose =~ s/ $//;
+        return $purpose;
+    }
+    return '';
+}
+
+
+##
+# Show the sub-reason entries of a reason code as markdown: a heading, and one
+# line for each entry with its purpose, so that the right one can be chosen.
+sub show_group {
+    my ($name) = @_;
+    my $group = $swigroups{$name};
+    my @entries = @{ $group->{'entries'} };
+    my $count = scalar(@entries);
+    print "# $name   **(SWI &$group->{'swi'})**\n\n";
+    print "This reason code is documented as $count entries:\n\n";
+    for my $entry (@entries)
+    {
+        my ($entryname, $link) = @{ $entry };
+        my $purpose = entry_purpose($link);
+        print "* **$entryname**" . ($purpose ne '' ? " - $purpose" : '') . "\n";
+    }
+    print "\nLook up one of these by its full name, for example `riscos-prm \"$entries[0][0]\"`.\n";
+}
+
+
+##
+# Show a summary of the URL specified as markdown.
+#
+# We try to use readable markdown to display information about the
+# interface.
+#
+# Only supported for SWI at present.
+sub show_summary {
+    my ($type, $name, $url) = @_;
+    my $key;
+    my $id;
+    if ($url =~ /^(.*)#(.*)/)
+    {
+        $url = $1;
+        $id = $2;
+    }
+    else
+    {
+        print STDERR "Cannot summarise '$type' $name at $url (no id present)\n";
+        exit(1);
+    }
+    $summary_url = $url;
+    ($key) = ($url =~ m!/([^/]+/[^/]+)$!);
+    if (!$key) {
+        print "Cannot extract key from $url (using bare names)\n" if ($debug);
+        $key = key_normalise("$type-$name");
+    } else {
+        $key =~ s!/!-!;
+        print "Extracted key from $url as $key\n" if ($debug);
+    }
+
+    print "Fetch $url for #$id\n" if ($debug);
+    my $page = get_url($key, $url);
+    $page =~ s/<.*?>/lc $&/ge;
+    if (! ($page =~ s/^.*\n([^\n]*<a name="$id">)/$1/s))
+    {
+        print STDERR "Cannot summarise '$type' $name at $url (id #$id not found)\n";
+        exit(1);
+    }
+    # Remove all anchors from the remaining text
+    $page =~ s/<a name=[^>]+><\/a>//g;
+    # Clean up paragraphs
+    $page =~ s/<p [^>]*>/<p>/g;
+    $page =~ s/<p>(.*?)<(\/?)p>/if ($2 eq '\/') { "<p>$1<\/p>"; } else { "<p>$1<\/p>\n<p>" }/ges;
+
+    my @lines = split /\n/, $page;
+    print "Read ".scalar(@lines)." lines after the id\n" if ($debug);
+
+    my @md;
+    # The first line should be the opening heading
+    my $first = shift @lines;
+    my ($head, $line);
+    ($head, $line) = ($first =~ /<(h\d)[^>]*>(.*)<\/\1>/);
+    if ($first =~ s/(<p>.*<\/p>)//)
+    {
+        # The purpose has been added to the end of the heading line;
+        # so push it onto the list to process next.
+        print "Appended purpose, so pushing to the next line\n" if ($debug);
+        unshift @lines, $1;
+    }
+    print "Line: $first\n" if ($debug);
+    if (!$line)
+    {
+        print STDERR "Cannot summarise '$type' $name at $url (opening heading missing)\n";
+        exit(1);
+    }
+    $line =~ s/<acronym>(.*?)<\/acronym>/$1/g;
+    $line =~ s/<br\/?>(.*?)\s*$/   **$1**/g;
+    $line = unescape($line);
+    print "Headline: $line\n" if ($debug);
+    push @md, "# $line";
+
+    # The second line is usually the summary of the purpose. Some entries
+    # (mostly Services) wrap it in more than one level of <dd>/<dl>
+    # indentation, so skip past any number of wrapper-only lines to reach it.
+    my $no_body = 0;
+    $first = shift @lines;
+    while (defined $first && $first =~ /^(?:<dd>|<dl>)$/)
+    {
+        $first = shift @lines;
+    }
+    if (!defined $first || $first =~ /<hr>/)
+    {
+        # A few entries have no documented body at all: the heading is
+        # immediately followed by the next entry's <hr>. Nothing to
+        # summarise beyond the heading, so stop here rather than reading
+        # into the next entry's content.
+        unshift @lines, $first if (defined $first);
+        $no_body = 1;
+        $line = "No further detail is documented for this call.";
+    }
+    else
+    {
+        ($line) = ($first =~ /<p>(.*)<\/p>/);
+        if (!$line)
+        {
+            # A couple of SWIs just don't have a purpose line. Let's populate it.
+            if ($name eq "Econet_NetworkParameters")
+            {
+                $line = "Read parameters for the Econet hardware";
+            }
+            elsif ($name eq "DragASprite_Start")
+            {
+                $line = "Start a sprite dragging operation";
+            }
+            else
+            {
+                print STDERR "Cannot summarise '$type' $name at $url (purpose missing)\n";
+                exit(1);
+            }
+        }
+    }
+    $line = unescape($line);
+    push @md, "$line";
+    push @md, "";
+
+    my $headsection = 'h5';
+    # Some documents have a <h4> instead of a <h5> for the heading blocks
+    if ($page =~ /<h4>On entry/)
+    {
+        # Switch the behaviour to handle these documents.
+        $headsection = 'h4';
+    }
+
+    my $ignore_section = 0;
+    my $acc = '';
+    my $section = '';
+    for $first ($no_body ? () : @lines)
+    {
+        $first =~ s/<d[dt]>//g;     # Strip the definitions that are used to indent
+        if ($first =~ /<hr>/)
+        {
+            # Break at the end of the SWI call.
+            last;
+        }
+        if (($headsection eq 'h5' && $first =~ /<h[234]/) ||
+            ($headsection eq 'h4' && $first =~ /<h[23]/))
+        {
+            # We definitely hit another SWI without a <hr>. Break out.
+            last;
+        }
+        if ($first =~ /<$headsection>\s*(.*?)\s*<\/$headsection>/)
+        {
+            $head = $1;
+            $head =~ s/:$//;
+            $head = 'On entry' if ($head eq 'On Entry');
+            if ($head eq 'On entry' ||
+                $head eq 'On exit' ||
+                $head eq 'Use')
+            {
+                push @md, "";
+                push @md, "## $head";
+                $section = $head;
+                $acc = '';
+                $ignore_section = 0;
+            }
+            elsif ($head eq 'Interrupts' ||
+                   $head eq 'Processor Mode' ||
+                   $head eq 'Processor mode' ||
+                   $head eq 'Re-entrant' ||
+                   $head eq 'Re-entrancy' ||
+                   $head eq 'Example' ||
+                   $head eq 'Related SWIs' ||
+                   $head eq 'Related reason codes' ||
+                   $head eq 'Related vectors')
+            {
+                $ignore_section = 1;
+            }
+            else
+            {
+                # A different type of heading... let's use '###'
+                last if ($acc); # Terminate if we left things in the buffer
+                push @md, "";
+                push @md, "### $head";
+                $ignore_section = 0;
+            }
+            next;
+        }
+        if (!$ignore_section)
+        {
+            if ($acc)
+            {
+                if ($acc =~ /<pre>/)
+                {
+                    $first = "$acc\n$first";
+                }
+                else
+                {
+                    $first = "$acc $first";
+                }
+            }
+            $first =~ s/^ +//;
+            $first =~ s/ +$//;
+            my $done = 0;
+            while (1)
+            {
+                last if ($done);
+                if ($first =~ s/^\s*<!--.*?-->\s*//s)
+                {
+                    # Editorial comments (eg errata markers) carry no content.
+                    next;
+                }
+                if ($first =~ s/^<h6>(.*?)<\/h6>//s)
+                {
+                    $line = unescape($1);
+                    push @md, "";
+                    push @md, "#### $line";
+                    push @md, "";
+                    next;
+                }
+                if ($first =~ s/^<p>(.*?)<\/p>//s)
+                {
+                    $line = $1;
+                    if ($line =~ s/<p>/<\/p><p>/g)
+                    {
+                        $first = "<p>$line</p>$first";
+                        next;
+                    }
+                    if ($line =~ /^<[uo]l>.*<\/[uo]l>/)
+                    {
+                        # Paragraph just containing a list
+                        $first = $line . $first;
+                        next;
+                    }
+                    if ($line =~ /^<pre>.*<\/pre>/s)
+                    {
+                        # Paragraph just containing a list
+                        $first = $line . $first;
+                        next;
+                    }
+                    if ($line =~ /^<table>.*<\/table>/)
+                    {
+                        # Paragraph just containing a table
+                        $first = $line . $first;
+                        next;
+                    }
+                    $line =~ s/<\/table>/<\/table>\n/g;
+                    $line =~ s/<br\/?>/\n/g;
+                    $line = unescape($line);
+                    if ($head eq 'On entry' || $head eq 'On exit')
+                    {
+                        push @md, map { if (/^[\*\|] /) { "  $_" } else { "* $_" } } split /\n/, $line;
+                    }
+                    else
+                    {
+                        push @md, split /\n/, $line;
+                    }
+                    push @md, "";
+                    next;
+                }
+                if ($first =~ s/^<p>(.*?)(<p>|<dl>|<dt>|<dd>)/<p>$1<\/p>$2/s)
+                {
+                    # This bit doesn't have a closing element, so implicitly close it, and
+                    # we will reprocess.
+                    next;
+                }
+                if ($first =~ s/^<([uo])l>(.*?)<\/\1l>//)
+                {
+                    $line = $2;
+                    # Nested lists are flattened in a summary. A paragraph
+                    # within a list usually introduces a complex table or
+                    # example, which is better represented by an ellipsis.
+                    $line =~ s/<\/?[uo]l>//g;
+                    $line =~ s/<\/li>/\n/g;
+                    $line =~ s/<li\/?>/\n* /g;
+                    if ($line =~ s/<p>.*/\n.../s)
+                    {
+                        $acc = '';
+                        $done = 1;
+                    }
+                    $line = unescape($line);
+
+                    push @md, split /\n/, $line;
+                    push @md, "";
+                    next;
+                }
+                if ($first =~ s/^<pre>(.*?)<\/pre>//s)
+                {
+                    $line = $1;
+                    $line = unescape($line);
+
+                    push @md, "";
+                    push @md, map { "    $_" } split /\n/, $line;
+                    push @md, "";
+                    next;
+                }
+                if ($first =~ s/^<table>(.*?)<\/table>//)
+                {
+                    $line = $1;
+                    if ($line =~ / rowspan/)
+                    {
+                        # Nope, we cannot handle that.
+                        $acc = $line;
+                        $done = 1;
+                        last;
+                    }
+                    my $untable = untable($line);
+                    push @md, split /\n/, $untable;
+                    next;
+                }
+                if ($first =~ s/^(<\/?dl>|<\/?dd>|<\/[uo]l>|<\/p>)//g)
+                {
+                    # This is just some indentation things; let's ignore them
+                    next;
+                }
+                if ($first =~ s/^([^<]+)//s)
+                {
+                    # Plain text sitting directly inside a <dl>/<dd> block,
+                    # eg a formula, rather than wrapped in its own <p>.
+                    $line = unescape($1);
+                    $line =~ s/^\s+//;
+                    $line =~ s/\s+$//;
+                    if ($line ne '')
+                    {
+                        if ($head eq 'On entry' || $head eq 'On exit')
+                        {
+                            push @md, map { if (/^[\*\|] /) { "  $_" } else { "* $_" } } split /\n/, $line;
+                        }
+                        else
+                        {
+                            push @md, split /\n/, $line;
+                        }
+                        push @md, "";
+                    }
+                    next;
+                }
+                last;
+            }
+            if ($done)
+            {
+                last;
+            }
+            $acc = $first;
+        }
+    }
+    if ($acc ne '')
+    {
+        print "Gave up with accumulator: $acc\n" if ($debug);
+        my $where = $section ne '' ? " of the $section section" : '';
+        push @md, "*(Additional detail$where is not shown here — see the [full documentation]($url#$id) for the complete text.)*";
+    }
+
+    push @md, "## Full documentation";
+    push @md, "[$key#$id]($url#$id)";
+
+    # Trim any empty sections
+    my @newmd;
+    my $lasth2 = 0;
+    my $lastblank = 0;
+    my $lasttable = 0;
+    for $line (@md)
+    {
+        if ($line =~ /^##/)
+        {
+            if ($lasth2)
+            {
+                pop @newmd;
+                $lastblank = 1;
+            }
+            $lasth2 = 1;
+            push @newmd, "" if (!$lastblank);
+        }
+        else
+        {
+            $lasth2 = 0;
+        }
+        next if ($line eq '' && $lastblank);
+        if ($lasttable && $line !~ /^\|/)
+        {
+            push @newmd, "";
+        }
+        push @newmd, $line;
+        $lastblank = ($line eq '');
+        $lasttable = ($line =~ /^\|/);
+    }
+    @md = @newmd;
+
+    print "Markdown:\n" if ($debug);
+    for $line (@md)
+    {
+        print "$line\n";
+    }
+}
+
+
+# Build our index of the keywords we can look up
+my $in_prm5a = 0;
+for my $section (@sections)
+{
+    my ($h3) = ($section =~ /<h3>(.*)<\/h3>/);
+    next if (!defined $h3);
+
+    # Forget any anchors
+    $h3 =~ s/<a name=.*?>//g;
+
+    my ($chapternum, $title) = ($h3 =~ /Chapter (\d+): (.*)/);
+    # If this section does not contain a chapter, skip it.
+    next if (!defined $chapternum);
+
+    if ($title =~ /Introduction to RISC OS 3\.5 and RISC OS 3\.6/)
+    {
+        $in_prm5a = 1;
+        print "---- Now in the supplement for RISC OS 3.5 and later\n" if ($debug);
+    }
+    elsif ($in_prm5a)
+    {
+        $title .= " (for RISC OS 3.5+)";
+    }
+    print "Found: #$chapternum : $title\n" if ($debug);
+
+    if ($section =~ /<a href="\.\.\/prm\/([^"]*?)[#"]/)
+    {
+        my $chapterlink;
+        $chapterlink = "$baseurl$1";
+        print "       $chapterlink\n" if ($debug);
+        $chapters{$chapternum} = $chapterlink;
+        $chapters{$title} = $chapterlink;
+    }
+
+    # Find all the links in this section
+    my @lis = ($section =~ /(<li><a href.*?<\/a>)/g);
+    for my $li (@lis)
+    {
+        my ($link, $name) = ($li =~ /<li><a href="\.\.\/prm\/([^"]*?(?:#[^"]*)?)">([^<]*)<\/a>/);
+        $name =~ s/&amp;/\&/g;
+        $name =~ s/  +/ /g;
+        print "       $link: $name\n" if ($debug);
+        $link = "$baseurl$link";
+
+        if ($name =~ /^\*[A-Z]/)
+        {
+            $commands{$name} = $link;
+        }
+        elsif ($name =~ /^([^ ]*(?: [A-F0-9&]+)?) \(SWI &([A-F0-9]+)\)/)
+        {
+            my $swiname = $1;
+            my $swinum = hex($2);
+            $swis{$swiname} = $link;
+            $swis{"X$swiname"} = $link;
+            if (!defined $swinums{$swinum} || ($swinum_names{$swinum} =~ / / && $swiname !~ / /)) {
+                $swinums{$swinum} = $link;
+                $swinum_names{$swinum} = $swiname;
+            }
+        }
+        elsif ($name =~ /^([^ ]*) +(\d+) *(-|-|to) *(\d+) +\(SWI &([A-F0-9]+)\)/)
+        {
+            print "       Range of reason codes for SWI ($2 - $4)\n" if ($debug);
+            my $swiname = $1;
+            my $swinum = hex($5);
+            for my $num ($2..$4)
+            {
+                print "         $swiname $num\n" if ($debug);
+                $swis{"$swiname $num"} = $link;
+                $swis{"X$swiname $num"} = $link;
+            }
+            if (!defined $swinums{$swinum}) {
+                $swinums{$swinum} = $link;
+                $swinum_names{$swinum} = $swiname;
+            }
+        }
+        elsif ($name =~ /^([^ ]*) +(\d+),(\d+) +\(SWI &([A-F0-9]+)\)/)
+        {
+            # A reason code with sub-reason codes, eg 'OS_Word 14,2'. These are
+            # catalogued under their full name, and also grouped under the
+            # reason code alone ('OS_Word 14') so that we can list them.
+            my ($swiname, $reason, $sub, $swihex) = ($1, $2, $3, $4);
+            my $swinum = hex($swihex);
+            print "       Sub-reason $sub of reason code $reason for SWI ($swiname)\n" if ($debug);
+            $swis{"$swiname $reason,$sub"} = $link;
+            $swis{"X$swiname $reason,$sub"} = $link;
+            for my $group ("$swiname $reason", "X$swiname $reason")
+            {
+                $swigroups{$group} //= { 'swi' => $swihex, 'entries' => [] };
+                my $prefix = ($group =~ /^X/ && $swiname !~ /^X/) ? 'X' : '';
+                push @{ $swigroups{$group}{'entries'} }, ["$prefix$swiname $reason,$sub", $link];
+            }
+            if (!defined $swinums{$swinum}) {
+                $swinums{$swinum} = $link;
+                $swinum_names{$swinum} = $swiname;
+            }
+        }
+        elsif ($name =~ /^([^ ]*)((?: [A-F0-9& -]+|and|, ?)*) \(SWI &([A-F0-9]+)\)/)
+        {
+            print "       Multiple reason codes for SWI ($2)\n" if ($debug);
+            my $swiname = $1;
+            my $swinum = hex($3);
+            my @numbers = ($2 =~ /(&[A-F0-9]+|[0-9]+)/g);
+            for my $num (@numbers)
+            {
+                print "         $swiname $num\n" if ($debug);
+                $swis{"$swiname $num"} = $link;
+                $swis{"X$swiname $num"} = $link;
+            }
+            if (!defined $swinums{$swinum}) {
+                $swinums{$swinum} = $link;
+                $swinum_names{$swinum} = $swiname;
+            }
+        }
+        elsif ($name =~ /^([^ ]*) \(Service Call &([A-F0-9]+)\)/)
+        {
+            my $servname = $1;
+            my $servnum = hex($2);
+            $services{$servname} = $link;
+            if (!defined $servicenums{$servnum} || ($servicenum_names{$servnum} =~ / / && $servname !~ / /)) {
+                $servicenums{$servnum} = $link;
+                $servicenum_names{$servnum} = $servname;
+            }
+        }
+        elsif ($name =~ /^([^ ]*) \(Vector &[A-F0-9]+\)/)
+        {
+            $vectors{$1} = $link;
+        }
+    }
+}
+
+if ($op eq 'list-vectors')
+{
+    print "Vectors:\n";
+    for my $v (sort keys %vectors)
+    {
+        print "  $v\n";
+    }
+}
+elsif ($op eq 'list-swis')
+{
+    print "SWIs:\n";
+    for my $v (sort grep { ! /^X/ } keys %swis)
+    {
+        print "  $v\n";
+    }
+}
+elsif ($op eq 'list-services')
+{
+    print "Services:\n";
+    for my $v (sort keys %services)
+    {
+        print "  $v\n";
+    }
+}
+elsif ($op eq 'list-commands')
+{
+    print "Commands:\n";
+    for my $v (sort keys %commands)
+    {
+        print "  $v\n";
+    }
+}
+elsif ($op eq 'list-chapters')
+{
+    print "Chapters:\n";
+    for my $v (sort grep { ! /^\d+$/ } keys %chapters)
+    {
+        print "  $v\n";
+    }
+}
+else
+{
+    if (!defined $request || $request eq '')
+    {
+        print STDERR "No search term given (try --help)\n";
+        exit(1);
+    }
+
+    # We want to search the keys for matches
+    my %allkeys;
+    my $want;
+    my @candidates;
+    if (scalar(keys %select_type) == 0)
+    {
+        # If nothing selected; select everything
+        $select_type{'vector'} = 1;
+        $select_type{'swi'} = 1;
+        $select_type{'chapter'} = 1;
+        $select_type{'command'} = 1;
+        $select_type{'service'} = 1;
+    }
+    if ($select_type{'chapter'})
+    {
+        for my $name (keys %chapters)
+        {
+            my $key = key_simplify($name);
+            $allkeys{$key} = ['Chapter', $name, $chapters{$name}];
+        }
+    }
+    if ($select_type{'vector'})
+    {
+        for my $name (keys %vectors)
+        {
+            my $key = key_simplify($name);
+            $allkeys{$key} = ['Vector', $name, $vectors{$name}];
+        }
+    }
+    if ($select_type{'command'})
+    {
+        for my $name (keys %commands)
+        {
+            my $key = key_simplify($name);
+            $allkeys{$key} = ['Command', $name, $commands{$name}];
+        }
+    }
+    if ($select_type{'service'})
+    {
+        for my $name (keys %services)
+        {
+            my $key = key_simplify($name);
+            $allkeys{$key} = ['Service', $name, $services{$name}];
+        }
+    }
+    if ($select_type{'swi'})
+    {
+        for my $name (keys %swis)
+        {
+            my $key = key_simplify($name);
+            #print "Found SWI '$name'\n" if ($debug);
+            $allkeys{$key} = ['SWI', $name, $swis{$name}];
+        }
+
+        # Reason codes made of sub-reason entries can be looked up as a group,
+        # unless the reason code has an entry of its own.
+        for my $name (keys %swigroups)
+        {
+            my $key = key_simplify($name);
+            next if (defined $allkeys{$key});
+            $allkeys{$key} = ['SWIGroup', $name, $swigroups{$name}{'entries'}[0][1]];
+        }
+    }
+
+    $want = key_simplify($request);
+    print "Simplified '$request' to '$want'\n" if ($debug);
+
+    # If the last parameter is a hex number, decode it. Skip this if the
+    # request already matches a catalogued name verbatim (eg some reason
+    # codes, such as PDriver_MiscOp's, are themselves named with a literal
+    # hex value and must not be rewritten to their decimal equivalent).
+    if ($want !~ /^(?:SWI|Service) /i && !defined $allkeys{$want} && $want =~ /^(.* )(?:&|0x)([0-9A-F]+)$/i)
+    {
+        my $base = $1;
+        my $num = hex($2);
+        print "Decoded hex reason code $2 to $num\n" if ($debug);
+        $want = "$base$num";
+    }
+
+    if ($want =~ /^SWI (?:&|0x)?([0-9A-F]+)$/i)
+    {
+        my $num = hex($1);
+        if (defined $swinums{$num})
+        {
+            print "Matched SWI number $num\n" if ($debug);
+            # Find the name for this SWI number if possible
+            my $found_name = "SWI &$1";
+            for my $name (keys %swis)
+            {
+                if ($swis{$name} eq $swinums{$num})
+                {
+                    $found_name = $name;
+                    last;
+                }
+            }
+            push @candidates, ['SWI', $found_name, $swinums{$num}];
+        }
+    }
+    elsif ($want =~ /^Service (?:&|0x)?([0-9A-F]+)$/i)
+    {
+        my $num = hex($1);
+        if (defined $servicenums{$num})
+        {
+            print "Matched Service number $num\n" if ($debug);
+            my $found_name = "Service &$1";
+            for my $name (keys %services)
+            {
+                if ($services{$name} eq $servicenums{$num})
+                {
+                    $found_name = $name;
+                    last;
+                }
+            }
+            push @candidates, ['Service', $found_name, $servicenums{$num}];
+        }
+    }
+
+    if (scalar(@candidates) == 0 && defined $allkeys{$want})
+    {
+        print "Directly matched key '$want'\n" if ($debug);
+        push @candidates, $allkeys{$want};
+    }
+    else
+    {
+        my %normalised;
+        $want = key_normalise($want);
+        for my $skey (sort keys %allkeys)
+        {
+            my $key = key_normalise($skey);
+            if ($want eq $key)
+            {
+                print "Matched normalised key '$skey'\n" if ($debug);
+                push @candidates, $allkeys{$skey};
+            }
+            $normalised{$key} = $allkeys{$skey};
+        }
+
+        if (scalar(@candidates) == 0)
+        {
+            # Still no matches, so we'll try a substring search
+            for my $key (sort keys %normalised)
+            {
+                if ($key =~ /\Q$want/)
+                {
+                    print "Matched substring '$want' in '$key'\n" if ($debug);
+                    push @candidates, $normalised{$key};
+                }
+            }
+        }
+    }
+
+    # Let's see if we can reduce this by killing X SWIs
+    if (scalar(@candidates) > 1)
+    {
+        my @newcandidates;
+        my %seen;
+        for my $cand (@candidates)
+        {
+            my ($type, $name, $link) = @{ $cand };
+            if ($type eq 'SWI')
+            {
+                if ($name =~ /^X(.*)$/)
+                {
+                    next if ($seen{$1});
+                }
+                $seen{$name} = 1;
+            }
+            push @newcandidates, $cand;
+        }
+        @candidates = @newcandidates;
+    }
+
+
+    # A reason code which is documented as sub-reason entries: in the markdown
+    # forms list the entries; otherwise treat them as several candidates, so
+    # that the URLs can be seen or the choice made.
+    if (scalar(@candidates) == 1 && $candidates[0][0] eq 'SWIGroup')
+    {
+        my $groupname = $candidates[0][1];
+        my @entries = @{ $swigroups{$groupname}{'entries'} };
+        if (scalar(@entries) > 1 && ($how eq 'default' || $how eq 'summary'))
+        {
+            show_group($groupname);
+            exit(0);
+        }
+        @candidates = map { ['SWI', @{ $_ }] } @entries;
+    }
+
+    if (scalar(@candidates) == 0)
+    {
+        print STDERR "No matches for $request\n";
+        exit(1);
+    }
+    elsif (scalar(@candidates) == 1)
+    {
+        my ($type, $name, $link) = @{ $candidates[0] };
+        if (($how eq 'default' && ($type eq 'SWI' || $type eq 'Service')) || $how eq 'summary')
+        {
+            print "Showing $type $name\n" if ($debug);
+            show_summary($type, $name, $link);
+        }
+        else
+        {
+            print "Opening $type $name\n" if ($debug);
+            open_url($link);
+        }
+    }
+    else
+    {
+        if ($how eq 'default' || $how eq 'summary')
+        {
+            my $allrenderable = 1;
+            for my $cand (@candidates)
+            {
+                my ($type, $name, $link) = @{ $cand };
+                if ($type ne 'SWI' && $type ne 'Service')
+                {
+                    $allrenderable = 0;
+                }
+            }
+            if ($allrenderable)
+            {
+                my $divider = 0;
+                for my $cand (@candidates)
+                {
+                    my ($type, $name, $link) = @{ $cand };
+                    if ($divider)
+                    {
+                        print "\n---\n";
+                    }
+                    show_summary($type, $name, $link);
+                    $divider = 1;
+                }
+                exit(0);
+            }
+        }
+        print "Multiple candidates:\n";
+        for my $cand (@candidates)
+        {
+            my ($type, $name, $link) = @{ $cand };
+            printf "  %-12s %s\n", $type, $name;
+            if ($how eq 'url')
+            {
+                printf "  %-12s %s\n\n", '', $link;
+            }
+        }
+        # If we failed to open the URL, we fail with an exit of 2
+        exit(2);
+    }
+}
