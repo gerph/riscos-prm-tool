@@ -1,0 +1,131 @@
+---
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-host:
+    name: Test on ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - name: Ubuntu
+            runner: ubuntu-latest
+          - name: macOS
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tool
+        run: |
+          perl -c riscos-prm
+          ./riscos-prm --help | grep -F "Syntax: riscos-prm"
+
+  test-debian:
+    name: Test on Debian
+    runs-on: ubuntu-latest
+    container:
+      image: debian:stable-slim
+    steps:
+      - name: Install test dependencies
+        run: |
+          apt-get update
+          apt-get install --yes git perl
+
+      - uses: actions/checkout@v7
+
+      - name: Check the tool
+        run: |
+          perl -c riscos-prm
+          ./riscos-prm --help | grep -F "Syntax: riscos-prm"
+
+  package:
+    name: Package release
+    needs:
+      - test-host
+      - test-debian
+    runs-on: ubuntu-latest
+    outputs:
+      archive: ${{ steps.version.outputs.archive }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Determine the version
+        id: version
+        env:
+          PULL_REQUEST_NUMBER: ${{ github.event.number }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+              git branch --force "pull-request-$PULL_REQUEST_NUMBER" HEAD
+          fi
+          eval "$(./ci-vars)"
+          archive="riscos-prm-$CI_PROJECT_VERSION.tar.gz"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "version=$CI_PROJECT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
+
+      - name: Create the release archive
+        env:
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          directory="riscos-prm-$VERSION"
+          mkdir -p "dist/$directory"
+          install -m 0755 riscos-prm "dist/$directory/riscos-prm"
+          install -m 0644 LICENSE "dist/$directory/LICENSE"
+          tar --sort=name \
+              --mtime="@$SOURCE_DATE_EPOCH" \
+              --owner=0 --group=0 --numeric-owner \
+              -C dist -czf "dist/$ARCHIVE" "$directory"
+
+      - name: Upload the release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: riscos-prm
+          path: dist/${{ steps.version.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release archive
+        uses: actions/download-artifact@v8
+        with:
+          name: riscos-prm
+          path: dist
+
+      - name: Check the release tag
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+        run: |
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+              echo "Tag $GITHUB_REF_NAME does not match ci-vars version $VERSION" >&2
+              exit 1
+          fi
+
+      - name: Create the GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: dist/${{ needs.package.outputs.archive }}
+          artifactContentType: application/gzip
+          draft: false
+          generateReleaseNotes: true
