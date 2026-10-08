@@ -50,11 +50,32 @@ jobs:
           perl -c riscos-prm
           ./riscos-prm --help | grep -F "Syntax: riscos-prm"
 
+  build-docs:
+    name: Build manual
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build PRM-in-XML documentation
+        uses: gerph/riscos-prminxml-action@v1
+        with:
+          files: prminxml/riscos-prm.xml
+          output: output/manual
+          style: prm
+
+      - name: Upload the manual
+        uses: actions/upload-artifact@v7
+        with:
+          name: riscos-prm-manual
+          path: output/manual
+          if-no-files-found: error
+
   package:
     name: Package release
     needs:
       - test-host
       - test-debian
+      - build-docs
     runs-on: ubuntu-latest
     outputs:
       archive: ${{ steps.version.outputs.archive }}
@@ -78,15 +99,26 @@ jobs:
           echo "version=$CI_PROJECT_VERSION" >> "$GITHUB_OUTPUT"
           echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
 
+      - name: Download the manual
+        uses: actions/download-artifact@v8
+        with:
+          name: riscos-prm-manual
+          path: output/manual
+
       - name: Create the release archive
         env:
           ARCHIVE: ${{ steps.version.outputs.archive }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           directory="riscos-prm-$VERSION"
-          mkdir -p "dist/$directory"
+          mkdir -p "dist/$directory/manual" "dist/$directory/prminxml"
           install -m 0755 riscos-prm "dist/$directory/riscos-prm"
           install -m 0644 LICENSE "dist/$directory/LICENSE"
+          install -m 0644 README.md "dist/$directory/README.md"
+          install -m 0644 output/manual/riscos-prm.html \
+              "dist/$directory/manual/riscos-prm.html"
+          install -m 0644 prminxml/riscos-prm.xml \
+              "dist/$directory/prminxml/riscos-prm.xml"
           tar --sort=name \
               --mtime="@$SOURCE_DATE_EPOCH" \
               --owner=0 --group=0 --numeric-owner \

@@ -1,0 +1,269 @@
+<?xml version="1.0"?>
+<!DOCTYPE riscos-prm PUBLIC "-//Gerph//DTD PRM documentation 1.03//EN"
+                            "http://gerph.org/dtd/103/prm.dtd">
+
+<riscos-prm>
+<chapter title="riscos-prm" docgroup="RISC OS Build Environment">
+
+<section title="Introduction and Overview">
+<p>
+<code type="shell">riscos-prm</code> locates entries in the online RISC OS Programmer's
+Reference Manuals. It accepts the name of a chapter, vector, command, service,
+or SWI and presents the matching documentation as a Markdown summary, a URL,
+or a page opened in a browser.
+</p>
+<p>
+SWIs and services are summarised in the terminal by default. Other entries
+are opened in a browser or browser-like tool. When standard output is not a
+terminal, the URL is printed instead, making the command suitable for use by
+scripts and other tools.
+</p>
+</section>
+
+<section title="Technical Details">
+<subsection title="Lookups">
+<p>
+An unqualified lookup searches chapters, vectors, commands, services, and
+SWIs. The singular category switches restrict the search to one or more of
+those categories. SWIs and services may also be selected by hexadecimal
+number using the forms <userinput>SWI number</userinput> and
+<userinput>Service number</userinput>.
+</p>
+<p>
+A SWI name followed by a reason number selects that reason, where the manual
+documents it separately. Names are matched without regard to case or spaces.
+The matching also allows for a leading <code type="shell">*</code> on command names and
+common differences involving the words "The", "module", and "RISC OS".
+</p>
+<p>
+If a lookup has a single match, that entry is handled using the selected
+output mode. If several entries match, they are listed and the command exits
+with status 2. Multiple SWI or service matches can be rendered together when
+all of them support summaries.
+</p>
+</subsection>
+
+<subsection title="Output modes">
+<p>
+The default output mode summarises SWIs and services as Markdown. Other types
+are opened using a browser command. <userinput>--url</userinput> prints the
+manual URL, <userinput>--open</userinput> requests browser opening, and
+<userinput>--summary</userinput> requests the interface summary. The
+<userinput>--no-tables</userinput> switch replaces Markdown tables in a
+summary with a simpler representation.
+</p>
+</subsection>
+
+<subsection title="Opening manual pages">
+<p>
+The <code type="shell">BROWSER</code> environment variable selects the browser command.
+When it is unset or set to <code type="shell">auto</code>,
+<code type="shell">riscos-prm</code> tries <code type="shell">host-open</code>,
+<code type="shell">w3m</code>, <code type="shell">links</code>, and
+<code type="shell">lynx</code>, followed by <code type="shell">open</code> on macOS or
+<code type="shell">xdg-open</code> on other host systems.
+</p>
+</subsection>
+
+<subsection title="Caching">
+<p>
+The manual index and fetched pages are cached in the
+<filename type="unix">riscos-prm</filename> directory below
+<code type="shell">XDG_CACHE_HOME</code>. If that environment variable is not set, the
+cache is stored in <filename type="unix">~/.cache/riscos-prm</filename>.
+Deleting the cached files causes them to be fetched again when next needed.
+</p>
+</subsection>
+
+<subsection title="Exit status">
+<p>
+The command returns one of the following status values:
+<list type="unordered">
+<item><p>0 - a reference was found and handled.</p></item>
+<item><p>1 - no reference was found.</p></item>
+<item><p>2 - multiple references matched.</p></item>
+<item><p>3 - no browser was available, or a summary could not be produced.</p></item>
+</list>
+</p>
+</subsection>
+</section>
+
+<section title="Commands">
+<command-definition name="riscos-prm"
+                    description="Looks up entries in the RISC OS Programmer's Reference Manuals">
+<syntax>
+ <optional><userreplace>options</userreplace></optional>
+ <userreplace>name</userreplace>
+</syntax>
+<syntax>
+ <optional><userreplace>options</userreplace></optional>
+ <text>SWI </text><userreplace>hex-number</userreplace>
+</syntax>
+<syntax>
+ <optional><userreplace>options</userreplace></optional>
+ <text>Service </text><userreplace>hex-number</userreplace>
+</syntax>
+<syntax> <switch name="-vectors"/> </syntax>
+<syntax> <switch name="-swis"/> </syntax>
+<syntax> <switch name="-services"/> </syntax>
+<syntax> <switch name="-commands"/> </syntax>
+<syntax> <switch name="-chapters"/> </syntax>
+<syntax> <switch name="-help"/> </syntax>
+
+<parameter name="options">
+ one or more output-mode, formatting, or category switches described below.
+</parameter>
+<parameter name="name">
+ the vector, SWI, service, command, chapter, or SWI reason to find.
+</parameter>
+<parameter name="hex-number">
+ the hexadecimal SWI or service number to find, without a leading ampersand.
+</parameter>
+<parameter switch="-url">
+ print the matching manual URL rather than opening the documentation.
+</parameter>
+<parameter switch="-open">
+ open the matching manual page using the selected browser command.
+</parameter>
+<parameter switch="-summary">
+ display a Markdown summary of the matching interface.
+</parameter>
+<parameter switch="-no-tables">
+ avoid Markdown tables in an interface summary.
+</parameter>
+<parameter switch="-vector">
+ restrict the lookup to vectors.
+</parameter>
+<parameter switch="-swi">
+ restrict the lookup to SWIs.
+</parameter>
+<parameter switch="-service">
+ restrict the lookup to services.
+</parameter>
+<parameter switch="-command">
+ restrict the lookup to commands.
+</parameter>
+<parameter switch="-chapter">
+ restrict the lookup to chapters.
+</parameter>
+<parameter switch="-vectors">
+ list every indexed vector name.
+</parameter>
+<parameter switch="-swis">
+ list every indexed SWI name.
+</parameter>
+<parameter switch="-services">
+ list every indexed service name.
+</parameter>
+<parameter switch="-commands">
+ list every indexed command name.
+</parameter>
+<parameter switch="-chapters">
+ list every indexed chapter name.
+</parameter>
+<parameter switch="-help">
+ display command syntax, options, examples, and exit statuses.
+</parameter>
+
+<use>
+<p>
+The command downloads the published manual index when it is not already
+cached, searches the selected categories, and handles the matching entry in
+the requested output mode. Quote a numeric lookup or a multi-word name when
+the shell would otherwise split it into separate arguments; unquoted name
+arguments are joined before matching.
+</p>
+<p>
+SWIs and services are summarised by default. Other entries are opened with
+the browser selected by <code type="shell">BROWSER</code>, or by the first
+available browser command. The manual index and fetched pages are retained in
+the user's cache directory.
+</p>
+<p>
+An exit status of 0 indicates a handled match. Status 1 means that nothing
+matched, status 2 means that several references matched, and status 3 means
+that no browser was available or the requested summary could not be produced.
+</p>
+</use>
+
+<example><command>*riscos-prm OS_UpCall</command></example>
+<example><command>*riscos-prm OS_File 1</command></example>
+<example><command>*riscos-prm CnPV</command></example>
+<example><command>*riscos-prm "SWI 33"</command></example>
+<example><command>*riscos-prm "Service 400C0"</command></example>
+<example><command>*riscos-prm Service_ErrorStarting</command></example>
+<example><command>*riscos-prm AddTinyDir</command></example>
+<example><command>*riscos-prm Squash</command></example>
+<example><command>*riscos-prm --chapters</command></example>
+<example><command>*riscos-prm --url Buffer Manager</command></example>
+
+<related>
+ <reference type="link"
+            href="http://www.riscos.com/support/developers/prm_index/prmindex.html"
+            name="RISC OS Programmer's Reference Manual index"/>
+</related>
+</command-definition>
+</section>
+
+<section title="Examples">
+<subsection title="Looking up interfaces by name">
+<p>
+Names can identify SWIs, vectors, services, commands, or modules. A trailing
+number selects a documented SWI reason.
+</p>
+<p>
+<extended-example type="shell"><userinput>riscos-prm OS_UpCall</userinput><br/>
+<userinput>riscos-prm OS_File 1</userinput><br/>
+<userinput>riscos-prm CnPV</userinput><br/>
+<userinput>riscos-prm Service_ErrorStarting</userinput><br/>
+<userinput>riscos-prm AddTinyDir</userinput><br/>
+<userinput>riscos-prm Squash</userinput></extended-example>
+</p>
+</subsection>
+
+<subsection title="Looking up numeric interfaces">
+<p>
+SWI and service numbers are hexadecimal. The following lookups select
+<code type="shell">OS_UpCall</code> and
+<code type="shell">Service_ErrorStarting</code> respectively.
+</p>
+<p>
+<extended-example type="shell"><userinput>riscos-prm "SWI 33"</userinput><br/>
+<userinput>riscos-prm "Service 400C0"</userinput></extended-example>
+</p>
+</subsection>
+
+<subsection title="URLs and listings">
+<p>
+The first command prints the URL for the Buffer Manager chapter. The second
+lists every indexed chapter.
+</p>
+<p>
+<extended-example type="shell"><userinput>riscos-prm --url Buffer Manager</userinput><br/>
+<userinput>riscos-prm --chapters</userinput></extended-example>
+</p>
+</subsection>
+</section>
+
+</chapter>
+
+<meta>
+ <maintainer>
+  <email name="Charles Ferguson" address="gerph@gerph.org"/>
+ </maintainer>
+ <disclaimer>
+  <p>&copy; 2026 Charles Ferguson. Distributed under the MIT Licence.</p>
+ </disclaimer>
+ <history>
+  <revision number="1" author="CF" date="08 Oct 2026" title="Initial version">
+   <change>Documented the command syntax, lookup behaviour, output modes,
+   caching, examples, and exit statuses.</change>
+  </revision>
+ </history>
+ <related>
+  <reference type="link"
+             href="http://www.riscos.com/support/developers/"
+             name="RISC OS Programmer's Reference Manuals"/>
+ </related>
+</meta>
+</riscos-prm>
